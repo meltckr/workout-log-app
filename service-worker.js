@@ -1,6 +1,6 @@
 // Workout Log PWA — service worker
 // Cache strategy: cache-first for the app shell, network-first for HTML.
-const VERSION = 'v1.0.1';
+const VERSION = 'v1.1.0';
 const SHELL_CACHE = `wlog-shell-${VERSION}`;
 
 const SHELL_FILES = [

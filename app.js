@@ -7,10 +7,11 @@
   const STORAGE = {
     state: 'wlog.state.v1',
     entries: 'wlog.entries.v1',
-    settings: 'wlog.settings.v1'
+    settings: 'wlog.settings.v1',
+    daily: 'wlog.daily.v1'
   };
 
-  const APP_VERSION = '1.0.1';
+  const APP_VERSION = '1.1.0';
 
   // ---------- State ----------
   const defaultState = {
@@ -46,10 +47,51 @@
   function saveEntries(arr) {
     save(STORAGE.entries, arr);
   }
+  function loadDaily() {
+    try {
+      const raw = localStorage.getItem(STORAGE.daily);
+      return raw ? JSON.parse(raw) : {};
+    } catch (_) { return {}; }
+  }
+  function saveDaily(obj) {
+    try { localStorage.setItem(STORAGE.daily, JSON.stringify(obj)); } catch (_) {}
+  }
 
   let state = load(STORAGE.state, defaultState);
   let settings = load(STORAGE.settings, defaultSettings);
   let entries = loadEntries();
+  let daily = loadDaily(); // { 'YYYY-MM-DD': { bodyWeight, energy, painStrain, notes, updatedAt } }
+
+  function getDaily(date) {
+    return daily[date] || { bodyWeight: '', energy: '', painStrain: '', notes: '' };
+  }
+  function setDaily(date, patch) {
+    const cur = getDaily(date);
+    const next = Object.assign({}, cur, patch, { updatedAt: Date.now() });
+    daily[date] = next;
+    saveDaily(daily);
+    return next;
+  }
+
+  // One-time migration: lift any per-entry meta into the daily store
+  (function migrateMeta() {
+    let migrated = false;
+    entries.forEach((e) => {
+      const hasMeta = e.bodyWeight || e.energy || e.painStrain;
+      if (!e.date || !hasMeta) return;
+      const cur = getDaily(e.date);
+      const next = {
+        bodyWeight: cur.bodyWeight || e.bodyWeight || '',
+        energy: cur.energy || e.energy || '',
+        painStrain: cur.painStrain || e.painStrain || ''
+      };
+      daily[e.date] = Object.assign({}, cur, next, { updatedAt: Date.now() });
+      // Strip from entry so it stays single-source-of-truth
+      delete e.bodyWeight; delete e.energy; delete e.painStrain;
+      migrated = true;
+    });
+    if (migrated) { saveDaily(daily); saveEntries(entries); }
+  })();
 
   // ---------- Helpers ----------
   const $ = (sel, el) => (el || document).querySelector(sel);
@@ -217,20 +259,21 @@
   }
   function exportJSON() {
     downloadBlob(`workout-log-${todayISO()}.json`, 'application/json',
-      JSON.stringify({ exportedAt: new Date().toISOString(), program: PLAN.program, entries }, null, 2));
+      JSON.stringify({ exportedAt: new Date().toISOString(), program: PLAN.program, entries, daily }, null, 2));
   }
   function exportCSV() {
-    const rows = [['date','day','exercise_code','exercise_name','week','set','weight','reps','rpe','done','body_weight','energy','pain_strain','notes']];
+    const rows = [['date','day','exercise_code','exercise_name','week','set','weight','reps','rpe','done','body_weight','energy','pain_strain','exercise_notes','daily_notes']];
     entries.forEach((e) => {
       const day = findDay(e.dayId);
       const ex = findExercise(day, e.exerciseCode);
       const exName = ex ? ex.name : e.exerciseCode;
+      const d = getDaily(e.date);
       const sets = e.sets || [];
       if (sets.length === 0) {
-        rows.push([e.date, e.dayId, e.exerciseCode, exName, e.week, '', '', '', '', '', e.bodyWeight || '', e.energy || '', e.painStrain || '', (e.notes || '').replace(/\n/g, ' ')]);
+        rows.push([e.date, e.dayId, e.exerciseCode, exName, e.week, '', '', '', '', '', d.bodyWeight || '', d.energy || '', d.painStrain || '', (e.notes || '').replace(/\n/g, ' '), (d.notes || '').replace(/\n/g, ' ')]);
       } else {
         sets.forEach((s, i) => {
-          rows.push([e.date, e.dayId, e.exerciseCode, exName, e.week, i + 1, s.weight ?? '', s.reps ?? '', s.rpe ?? '', s.done ? 1 : 0, e.bodyWeight || '', e.energy || '', e.painStrain || '', (e.notes || '').replace(/\n/g, ' ')]);
+          rows.push([e.date, e.dayId, e.exerciseCode, exName, e.week, i + 1, s.weight ?? '', s.reps ?? '', s.rpe ?? '', s.done ? 1 : 0, d.bodyWeight || '', d.energy || '', d.painStrain || '', (e.notes || '').replace(/\n/g, ' '), (d.notes || '').replace(/\n/g, ' ')]);
         });
       }
     });
@@ -246,7 +289,7 @@
       try {
         const data = JSON.parse(reader.result);
         if (!Array.isArray(data.entries)) throw new Error('bad format');
-        // merge, keep newest
+        // merge entries, keep newest
         const map = new Map();
         entries.concat(data.entries).forEach((e) => {
           const cur = map.get(e.key);
@@ -254,6 +297,17 @@
         });
         entries = Array.from(map.values());
         saveEntries(entries);
+        // merge daily, newest updatedAt wins
+        if (data.daily && typeof data.daily === 'object') {
+          Object.keys(data.daily).forEach((date) => {
+            const incoming = data.daily[date];
+            const cur = daily[date];
+            if (!cur || (incoming.updatedAt || 0) > (cur.updatedAt || 0)) {
+              daily[date] = incoming;
+            }
+          });
+          saveDaily(daily);
+        }
         toast(`Imported ${data.entries.length}`);
         render();
       } catch (_) { toast('Import failed'); }
@@ -321,6 +375,36 @@
     return !!e.completed;
   }
 
+  function buildDailyCard(date) {
+    const d = getDaily(date);
+    const card = el('div', { class: 'card' });
+    card.appendChild(el('div', { class: 'card-title' }, [
+      el('span', null, ['Today']),
+      el('span', { class: 'muted', style: 'font-size:12px;font-weight:600' }, [date])
+    ]));
+    const grid = el('div', { class: 'meta-grid' });
+
+    const bw = el('input', { type: 'number', inputmode: 'decimal', step: '0.1', placeholder: 'lb', value: d.bodyWeight || '' });
+    bw.oninput = () => { setDaily(date, { bodyWeight: bw.value }); };
+    grid.appendChild(el('div', null, [el('span', { class: 'label' }, ['Body weight']), bw]));
+
+    const energy = el('input', { type: 'number', inputmode: 'numeric', min: '1', max: '10', placeholder: '1–10', value: d.energy || '' });
+    energy.oninput = () => { setDaily(date, { energy: energy.value }); };
+    grid.appendChild(el('div', null, [el('span', { class: 'label' }, ['Energy 1–10']), energy]));
+
+    const pain = el('input', { type: 'number', inputmode: 'numeric', min: '0', max: '10', placeholder: '0–10', value: d.painStrain || '' });
+    pain.oninput = () => { setDaily(date, { painStrain: pain.value }); };
+    grid.appendChild(el('div', null, [el('span', { class: 'label' }, ['Pain / strain']), pain]));
+
+    const notes = el('input', { type: 'text', placeholder: 'How you feel today (optional)', value: d.notes || '' });
+    notes.oninput = () => { setDaily(date, { notes: notes.value }); };
+    const notesWrap = el('div', { class: 'full' }, [el('span', { class: 'label' }, ['Daily note']), notes]);
+    grid.appendChild(notesWrap);
+
+    card.appendChild(grid);
+    return card;
+  }
+
   // ----- PLAN -----
   function viewPlan() {
     const view = $('#view');
@@ -332,6 +416,8 @@
 
     const day = findDay(state.dayId);
     const date = todayISO();
+
+    view.appendChild(buildDailyCard(date));
     const total = day.exercises.length;
     const doneCount = day.exercises.filter((ex) => isExerciseDone(date, day.id, ex.code, state.week)).length;
     const pct = total ? Math.round((doneCount / total) * 100) : 0;
@@ -432,9 +518,6 @@
         dayId: day.id,
         exerciseCode: ex.code,
         week: state.week,
-        bodyWeight: '',
-        energy: '',
-        painStrain: '',
         notes: '',
         completed: false,
         sets: Array.from({ length: rx ? rx.sets : 3 }, () => ({ weight: '', reps: '', rpe: '', done: false }))
@@ -465,28 +548,15 @@
     ]);
     view.appendChild(headCard);
 
-    // Date + body meta
+    // Date is per-exercise; daily metrics (body weight, energy, pain/strain) are shared per date.
     const metaCard = el('div', { class: 'card' });
-    metaCard.appendChild(el('div', { class: 'card-title' }, ['Session']));
-    const metaGrid = el('div', { class: 'meta-grid' });
-
+    metaCard.appendChild(el('div', { class: 'card-title' }, [
+      el('span', null, ['Session date']),
+      el('span', { class: 'muted', style: 'font-size:12px;font-weight:600' }, ['Daily metrics in Plan tab'])
+    ]));
     const dateInput = el('input', { type: 'date', value: entry.date });
     dateInput.oninput = () => { entry.date = dateInput.value || todayISO(); persist(); };
-    metaGrid.appendChild(el('div', null, [el('span', { class: 'label' }, ['Date']), dateInput]));
-
-    const bw = el('input', { type: 'number', inputmode: 'decimal', step: '0.1', placeholder: 'lb', value: entry.bodyWeight || '' });
-    bw.oninput = () => { entry.bodyWeight = bw.value; persist(); };
-    metaGrid.appendChild(el('div', null, [el('span', { class: 'label' }, ['Body weight']), bw]));
-
-    const energy = el('input', { type: 'number', inputmode: 'numeric', min: '1', max: '10', placeholder: '1–10', value: entry.energy || '' });
-    energy.oninput = () => { entry.energy = energy.value; persist(); };
-    metaGrid.appendChild(el('div', null, [el('span', { class: 'label' }, ['Energy 1–10']), energy]));
-
-    const pain = el('input', { type: 'number', inputmode: 'numeric', min: '0', max: '10', placeholder: '0–10', value: entry.painStrain || '' });
-    pain.oninput = () => { entry.painStrain = pain.value; persist(); };
-    metaGrid.appendChild(el('div', null, [el('span', { class: 'label' }, ['Pain / strain']), pain]));
-
-    metaCard.appendChild(metaGrid);
+    metaCard.appendChild(dateInput);
     view.appendChild(metaCard);
 
     // Sets table
