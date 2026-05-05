@@ -11,7 +11,7 @@
     daily: 'wlog.daily.v1'
   };
 
-  const APP_VERSION = '1.1.0';
+  const APP_VERSION = '1.2.0';
 
   // ---------- State ----------
   const defaultState = {
@@ -375,6 +375,60 @@
     return !!e.completed;
   }
 
+  function buildVideoCard(ex) {
+    if (!ex.wistiaId && !ex.videoSlug) return null;
+    const card = el('div', { class: 'card video-card' });
+    if (ex.wistiaId) {
+      // Lazy-load: show poster + tap-to-play, then swap in the iframe.
+      const frame = el('div', { class: 'video-frame', role: 'button', 'aria-label': `Play ${ex.name} demo` });
+      const thumb = el('img', {
+        class: 'vthumb',
+        loading: 'lazy',
+        alt: '',
+        src: `https://embed-ssl.wistia.com/deliveries/${ex.wistiaId}.jpg?image_crop_resized=640x360`
+      });
+      // If the named-deliveries thumb 404s, swap to the embed/medias thumbnail endpoint.
+      thumb.onerror = () => { thumb.src = `https://fast.wistia.com/embed/medias/${ex.wistiaId}/swatch`; };
+      const play = el('button', { class: 'vplay', 'aria-label': 'Play video' }, ['▶']);
+      frame.appendChild(thumb);
+      frame.appendChild(play);
+      const activate = () => {
+        const iframe = el('iframe', {
+          src: `https://fast.wistia.net/embed/iframe/${ex.wistiaId}?playerColor=f5b400&autoPlay=true&playsinline=true`,
+          allow: 'autoplay; fullscreen; picture-in-picture',
+          allowfullscreen: '',
+          title: `${ex.name} demo`
+        });
+        frame.innerHTML = '';
+        frame.appendChild(iframe);
+      };
+      frame.addEventListener('click', activate);
+      play.addEventListener('click', (e) => { e.stopPropagation(); activate(); });
+      card.appendChild(frame);
+    } else {
+      // Slug exists but no Wistia ID found — fall back to a link to the page.
+      card.appendChild(el('div', { class: 'video-fallback' }, [
+        el('span', null, ['Watch on Infinity Fitness → ']),
+        el('a', {
+          href: `https://www.infinityfitness.com/video/${ex.videoSlug}/`,
+          target: '_blank',
+          rel: 'noopener'
+        }, [ex.videoSlug.replace(/-/g, ' ')])
+      ]));
+    }
+    if (ex.videoSlug) {
+      card.appendChild(el('div', { class: 'video-meta' }, [
+        el('span', null, ['Demo · Infinity Fitness']),
+        el('a', {
+          href: `https://www.infinityfitness.com/video/${ex.videoSlug}/`,
+          target: '_blank',
+          rel: 'noopener'
+        }, ['Open page ↗'])
+      ]));
+    }
+    return card;
+  }
+
   function buildDailyCard(date) {
     const d = getDaily(date);
     const card = el('div', { class: 'card' });
@@ -435,6 +489,9 @@
     day.exercises.forEach((ex) => {
       const rx = findRx(ex, state.week);
       const done = isExerciseDone(date, day.id, ex.code, state.week);
+      const nameRow = el('div', { class: 'ex-name' });
+      nameRow.appendChild(document.createTextNode(ex.name));
+      if (ex.wistiaId) nameRow.appendChild(el('span', { class: 'ex-vbadge', 'aria-label': 'Has video' }, ['▶']));
       const row = el('button', {
         class: 'exercise-row' + (done ? ' done' : ''),
         onclick: () => setState({ tab: 'log', exerciseCode: ex.code })
@@ -442,7 +499,7 @@
         el('div', { class: 'ex-left' }, [
           el('div', { class: 'ex-code' }, [ex.code]),
           el('div', null, [
-            el('div', { class: 'ex-name' }, [ex.name]),
+            nameRow,
             ex.notes ? el('div', { class: 'ex-notes' }, [ex.notes]) : null
           ])
         ]),
@@ -547,6 +604,10 @@
       rxCells(rx)
     ]);
     view.appendChild(headCard);
+
+    // Video card (lazy-loaded)
+    const videoCard = buildVideoCard(ex);
+    if (videoCard) view.appendChild(videoCard);
 
     // Date is per-exercise; daily metrics (body weight, energy, pain/strain) are shared per date.
     const metaCard = el('div', { class: 'card' });

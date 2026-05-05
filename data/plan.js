@@ -19,6 +19,8 @@ window.PLAN = {
           code: "A1",
           name: "Serrano extensions",
           notes: "30 deg incline",
+          videoSlug: "serrano-extensions",
+          wistiaId: "h4sudn971z",
           weeks: [
             { week: 1, sets: 3, tempo: "3-1-1-1", reps: "(6-8)",   rest: 45 },
             { week: 2, sets: 3, tempo: "3-1-1-1", reps: "(6-8)",   rest: 45 },
@@ -32,6 +34,8 @@ window.PLAN = {
           code: "A2",
           name: "Prone bilateral trap 2 lift",
           notes: "30 deg incline",
+          videoSlug: "prone-bilateral-trap-2-lift",
+          wistiaId: "12e8duh0xs",
           weeks: [
             { week: 1, sets: 3, tempo: "3-1-1-2", reps: "(6-8)", rest: 45 },
             { week: 2, sets: 3, tempo: "3-1-1-2", reps: "(6-8)", rest: 45 },
@@ -45,6 +49,8 @@ window.PLAN = {
           code: "B1",
           name: "Wide grip / rhomboid pull down",
           notes: "wide grip 3 inches wider than shoulder width",
+          videoSlug: "rhomboid-pull-down",
+          wistiaId: "js2vu95bqg",
           weeks: [
             { week: 1, sets: 3, tempo: "3-1-1-2", reps: "(4-6)-(6-8)", rest: 60 },
             { week: 2, sets: 3, tempo: "3-1-1-2", reps: "(4-6)-(6-8)", rest: 60 },
@@ -58,6 +64,8 @@ window.PLAN = {
           code: "B2",
           name: "Semi neutral grip press",
           notes: "30 deg incline",
+          videoSlug: "semi-neutral-grip-db-press",
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 3, tempo: "3-2-1-1", reps: "(4-6)-(6-8)", rest: 60 },
             { week: 2, sets: 3, tempo: "3-2-1-1", reps: "(4-6)-(6-8)", rest: 60 },
@@ -71,6 +79,8 @@ window.PLAN = {
           code: "C1",
           name: "Chest supported UH Row",
           notes: "bring db to hip, palms facing up, 30 deg incline",
+          videoSlug: "chest-supported-uh-row",
+          wistiaId: "wrnxp31i3l",
           weeks: [
             { week: 1, sets: 3, tempo: "3-1-1-2", reps: "(4-6)-(6-8)", rest: 60 },
             { week: 2, sets: 3, tempo: "3-1-1-2", reps: "(4-6)-(6-8)", rest: 60 },
@@ -84,6 +94,8 @@ window.PLAN = {
           code: "C2",
           name: "Push ups",
           notes: "",
+          videoSlug: "3-execution-push-up",
+          wistiaId: "7ongc2wm97",
           weeks: [
             { week: 1, sets: 3, tempo: "4-1-x-0", reps: "10", rest: 60 },
             { week: 2, sets: 3, tempo: "4-1-x-0", reps: "10", rest: 60 },
@@ -103,6 +115,8 @@ window.PLAN = {
           code: "A1",
           name: "Goblet Squat",
           notes: "touch glutes on parallel depth marker",
+          videoSlug: null,
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 3, tempo: "4-2-1-0", reps: "(6-8)", rest: 60 },
             { week: 2, sets: 3, tempo: "4-2-1-0", reps: "(6-8)", rest: 60 },
@@ -116,6 +130,8 @@ window.PLAN = {
           code: "B1",
           name: "Body weight squat",
           notes: "touch glutes on parallel depth marker",
+          videoSlug: "body-weight-squat",
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 3, tempo: "3-2-1-1", reps: "16", rest: 60 },
             { week: 2, sets: 3, tempo: "3-2-1-1", reps: "16", rest: 60 },
@@ -129,6 +145,8 @@ window.PLAN = {
           code: "B2",
           name: "Rear Leg Elevated Lunge",
           notes: "20 seconds rest between legs",
+          videoSlug: "rear-leg-elevated-lunge",
+          wistiaId: "1qaizqns1t",
           weeks: [
             { week: 1, sets: 3, tempo: "3-2-1-1", reps: "(6-8)", rest: 60 },
             { week: 2, sets: 3, tempo: "3-2-1-1", reps: "(6-8)", rest: 60 },
@@ -142,6 +160,8 @@ window.PLAN = {
           code: "B2b",
           name: "Ball squeeze",
           notes: "squeeze med ball between knees, lay on back (sheet labels this B2 a second time)",
+          videoSlug: null,
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 3, tempo: "na", reps: "20 sec", rest: 60 },
             { week: 2, sets: 3, tempo: "na", reps: "20 sec", rest: 60 },
@@ -155,6 +175,8 @@ window.PLAN = {
           code: "C1",
           name: "Hamstring Pray contractions",
           notes: "padding under knees",
+          videoSlug: "hamstring-pray-contractions",
+          wistiaId: "ckhmru8wmr",
           weeks: [
             { week: 1, sets: 3, tempo: "na", reps: "20 sec", rest: 60 },
             { week: 2, sets: 3, tempo: "na", reps: "20 sec", rest: 60 },
@@ -168,6 +190,8 @@ window.PLAN = {
           code: "D1",
           name: "Unilateral toe raise",
           notes: "",
+          videoSlug: null,
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 2, tempo: "3-2-1-2", reps: "8",  rest: 45 },
             { week: 2, sets: 2, tempo: "3-2-1-2", reps: "8",  rest: 45 },
@@ -181,6 +205,8 @@ window.PLAN = {
           code: "D2",
           name: "Standing unilateral calf raise",
           notes: "elevate working foot",
+          videoSlug: "seated-unilateral-calf-raise",
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 2, tempo: "3-2-1-2", reps: "6", rest: 45 },
             { week: 2, sets: 2, tempo: "3-2-1-2", reps: "6", rest: 45 },
@@ -200,6 +226,8 @@ window.PLAN = {
           code: "A1",
           name: "A Press",
           notes: "",
+          videoSlug: "a-press",
+          wistiaId: "i6bigrfhs4",
           weeks: [
             { week: 1, sets: 2, tempo: "3-1-1-2", reps: "(6-8)", rest: 45 },
             { week: 2, sets: 2, tempo: "3-1-1-2", reps: "(6-8)", rest: 45 },
@@ -213,6 +241,8 @@ window.PLAN = {
           code: "A2",
           name: "Supinated lat push down",
           notes: "",
+          videoSlug: "supinated-lat-push-down",
+          wistiaId: "h6sun0rrqg",
           weeks: [
             { week: 1, sets: 2, tempo: "3-1-1-3", reps: "(6-8)", rest: 45 },
             { week: 2, sets: 2, tempo: "3-1-1-3", reps: "(6-8)", rest: 45 },
@@ -226,6 +256,8 @@ window.PLAN = {
           code: "B1",
           name: "Preacher unilateral db curl",
           notes: "no rest between arms",
+          videoSlug: "blast-pause-preacher-curls",
+          wistiaId: "w7jpqstvcu",
           weeks: [
             { week: 1, sets: 3, tempo: "4-2-1-1", reps: "(4-6)-(6-8)", rest: 45 },
             { week: 2, sets: 3, tempo: "4-2-1-1", reps: "(4-6)-(6-8)", rest: 45 },
@@ -239,6 +271,8 @@ window.PLAN = {
           code: "B2",
           name: "Prone Hammer curl",
           notes: "30 deg incline, palms facing each other",
+          videoSlug: null,
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 3, tempo: "3-1-1-2", reps: "(4-6)-(6-8)", rest: 60 },
             { week: 2, sets: 3, tempo: "3-1-1-2", reps: "(4-6)-(6-8)", rest: 60 },
@@ -252,6 +286,8 @@ window.PLAN = {
           code: "C1",
           name: "Prone db triceps kick back (supinated)",
           notes: "supinated grip, 30 deg incline",
+          videoSlug: "ischemic-prone-triceps-kick-back-series",
+          wistiaId: "rzr54yf296",
           weeks: [
             { week: 1, sets: 3, tempo: "3-1-1-3", reps: "(4-6)-(6-8)", rest: 45 },
             { week: 2, sets: 3, tempo: "3-1-1-3", reps: "(4-6)-(6-8)", rest: 45 },
@@ -265,6 +301,8 @@ window.PLAN = {
           code: "C2",
           name: "Prone db triceps kick back (neutral)",
           notes: "neutral grip, 30 deg incline",
+          videoSlug: "multiple-head-triceps-kick-backs",
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 3, tempo: "2-1-1-1", reps: "(4-6)-(6-8)", rest: 60 },
             { week: 2, sets: 3, tempo: "2-1-1-1", reps: "(4-6)-(6-8)", rest: 60 },
@@ -284,6 +322,8 @@ window.PLAN = {
           code: "A1",
           name: "Swiss ball leg lower",
           notes: "squeeze swiss ball between ankles, keep lower back pressed into floor",
+          videoSlug: null,
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 4, tempo: "5-1-1-1", reps: "6", rest: 45 },
             { week: 2, sets: 4, tempo: "5-1-1-1", reps: "6", rest: 45 },
@@ -297,6 +337,8 @@ window.PLAN = {
           code: "A2",
           name: "Standing cable core contraction / rotation",
           notes: "",
+          videoSlug: "cable-rotations",
+          wistiaId: "n3v0ji8rqj",
           weeks: [
             { week: 1, sets: 4, tempo: "na", reps: "6", rest: 45 },
             { week: 2, sets: 4, tempo: "na", reps: "6", rest: 45 },
@@ -310,6 +352,8 @@ window.PLAN = {
           code: "B1",
           name: "Partial swiss ball crunch",
           notes: "",
+          videoSlug: "partial-swiss-ball-crunch",
+          wistiaId: "4cj7t1v9qo",
           weeks: [
             { week: 1, sets: 4, tempo: "3-2-1-3", reps: "6", rest: 45 },
             { week: 2, sets: 4, tempo: "3-2-1-3", reps: "6", rest: 45 },
@@ -323,6 +367,8 @@ window.PLAN = {
           code: "B2",
           name: "Back extensions",
           notes: "arms stretched out ahead",
+          videoSlug: null,
+          wistiaId: null,
           weeks: [
             { week: 1, sets: 4, tempo: "3-1-1-3", reps: "6", rest: 45 },
             { week: 2, sets: 4, tempo: "3-1-1-3", reps: "6", rest: 45 },
