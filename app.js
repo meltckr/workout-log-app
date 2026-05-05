@@ -11,7 +11,7 @@
     daily: 'wlog.daily.v1'
   };
 
-  const APP_VERSION = '1.2.0';
+  const APP_VERSION = '1.3.0';
 
   // ---------- State ----------
   const defaultState = {
@@ -25,7 +25,9 @@
     supabaseUrl: '',
     supabaseAnonKey: '',
     supabaseTable: 'workout_entries',
-    userId: ''
+    dailyTable: 'workout_daily',
+    userId: '',
+    autoSync: true
   };
 
   function load(key, fallback) {
@@ -70,6 +72,7 @@
     const next = Object.assign({}, cur, patch, { updatedAt: Date.now() });
     daily[date] = next;
     saveDaily(daily);
+    maybeSyncDaily(date, next);
     return next;
   }
 
@@ -163,87 +166,243 @@
   }
 
   // ---------- Cloud sync (optional) ----------
-  function cloudReady() {
-    return settings.supabaseUrl && settings.supabaseAnonKey && settings.supabaseTable;
+  // Status: 'idle' | 'syncing' | 'ok' | 'error' | 'off'
+  let syncStatus = 'off';
+  let syncMessage = '';
+  let syncListeners = [];
+  function setSyncStatus(s, m) {
+    syncStatus = s;
+    syncMessage = m || '';
+    syncListeners.forEach((fn) => { try { fn(); } catch (_) {} });
   }
-  function maybeSyncCloud(entry) {
-    if (!cloudReady()) return;
-    fetch(`${settings.supabaseUrl}/rest/v1/${settings.supabaseTable}`, {
-      method: 'POST',
-      headers: {
-        'apikey': settings.supabaseAnonKey,
-        'Authorization': `Bearer ${settings.supabaseAnonKey}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'resolution=merge-duplicates,return=minimal'
-      },
-      body: JSON.stringify([{
-        entry_key: entry.key,
-        user_id: settings.userId || null,
-        date: entry.date,
-        day_id: entry.dayId,
-        exercise_code: entry.exerciseCode,
-        week: entry.week,
-        payload: entry,
-        updated_at: new Date(entry.updatedAt).toISOString()
-      }])
-    }).catch(() => {});
+  function onSyncChange(fn) { syncListeners.push(fn); return () => { syncListeners = syncListeners.filter((x) => x !== fn); }; }
+
+  function cloudReady() {
+    return !!(settings.supabaseUrl && settings.supabaseAnonKey && settings.supabaseTable);
+  }
+  function sbHeaders(extra) {
+    return Object.assign({
+      'apikey': settings.supabaseAnonKey,
+      'Authorization': `Bearer ${settings.supabaseAnonKey}`
+    }, extra || {});
+  }
+  function sbUrl(table, qs) {
+    const base = settings.supabaseUrl.replace(/\/$/, '');
+    return `${base}/rest/v1/${table}${qs ? '?' + qs : ''}`;
+  }
+  function userFilter() {
+    // user_id is nullable. If user provided one, scope reads/writes to it.
+    return settings.userId ? `user_id=eq.${encodeURIComponent(settings.userId)}` : '';
   }
 
-  async function syncCloudPull() {
-    if (!cloudReady()) { toast('Add Supabase URL and key in App tab'); return; }
+  // Debounced auto-push, batches multiple quick edits into a single round-trip
+  const pendingEntries = new Map(); // key -> entry
+  const pendingDaily = new Map();   // date -> daily row
+  let pushTimer = null;
+  function scheduleAutoPush() {
+    if (!settings.autoSync || !cloudReady()) return;
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(flushPending, 800);
+  }
+  async function flushPending() {
+    if (!cloudReady()) return;
+    const eBatch = Array.from(pendingEntries.values());
+    const dBatch = Array.from(pendingDaily.values());
+    pendingEntries.clear();
+    pendingDaily.clear();
+    if (eBatch.length === 0 && dBatch.length === 0) return;
+    setSyncStatus('syncing', 'Saving to cloud…');
     try {
-      const res = await fetch(`${settings.supabaseUrl}/rest/v1/${settings.supabaseTable}?select=*`, {
-        headers: {
-          'apikey': settings.supabaseAnonKey,
-          'Authorization': `Bearer ${settings.supabaseAnonKey}`
-        }
-      });
-      if (!res.ok) throw new Error('Pull failed');
-      const rows = await res.json();
-      let merged = 0;
-      rows.forEach((r) => {
-        const local = entries.find((e) => e.key === r.entry_key);
+      if (eBatch.length) {
+        const body = eBatch.map((e) => ({
+          entry_key: e.key,
+          user_id: settings.userId || null,
+          date: e.date,
+          day_id: e.dayId,
+          exercise_code: e.exerciseCode,
+          week: e.week,
+          payload: e,
+          updated_at: new Date(e.updatedAt || Date.now()).toISOString()
+        }));
+        const res = await fetch(sbUrl(settings.supabaseTable), {
+          method: 'POST',
+          headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify(body)
+        });
+        if (!res.ok) throw new Error(`entries ${res.status}`);
+      }
+      if (dBatch.length) {
+        const body = dBatch.map((d) => ({
+          date: d.date,
+          user_id: settings.userId || null,
+          body_weight: d.bodyWeight || null,
+          energy: d.energy || null,
+          pain_strain: d.painStrain || null,
+          notes: d.notes || null,
+          payload: d,
+          updated_at: new Date(d.updatedAt || Date.now()).toISOString()
+        }));
+        const res = await fetch(sbUrl(settings.dailyTable), {
+          method: 'POST',
+          headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify(body)
+        });
+        if (!res.ok) throw new Error(`daily ${res.status}`);
+      }
+      setSyncStatus('ok', `Synced ${eBatch.length + dBatch.length}`);
+    } catch (e) {
+      // Re-queue so we retry on next change
+      eBatch.forEach((x) => pendingEntries.set(x.key, x));
+      dBatch.forEach((x) => pendingDaily.set(x.date, x));
+      setSyncStatus('error', String(e && e.message || e));
+    }
+  }
+
+  function maybeSyncCloud(entry) {
+    if (!settings.autoSync || !cloudReady()) return;
+    pendingEntries.set(entry.key, entry);
+    scheduleAutoPush();
+  }
+  function maybeSyncDaily(date, row) {
+    if (!settings.autoSync || !cloudReady()) return;
+    pendingDaily.set(date, Object.assign({ date }, row));
+    scheduleAutoPush();
+  }
+
+  async function syncCloudPull(opts) {
+    opts = opts || {};
+    if (!cloudReady()) {
+      if (!opts.silent) toast('Add Supabase URL and key in App tab');
+      return { ok: false, reason: 'not-configured' };
+    }
+    setSyncStatus('syncing', 'Pulling from cloud…');
+    try {
+      const uf = userFilter();
+      const eRes = await fetch(sbUrl(settings.supabaseTable, `select=*${uf ? '&' + uf : ''}`), { headers: sbHeaders() });
+      if (!eRes.ok) throw new Error(`entries ${eRes.status}`);
+      const eRows = await eRes.json();
+      let mergedE = 0;
+      eRows.forEach((r) => {
         const remote = r.payload;
         if (!remote) return;
+        const local = entries.find((e) => e.key === r.entry_key);
         if (!local || (remote.updatedAt || 0) > (local.updatedAt || 0)) {
           remote.key = r.entry_key;
           const idx = entries.findIndex((e) => e.key === remote.key);
           if (idx >= 0) entries[idx] = remote; else entries.push(remote);
-          merged++;
+          mergedE++;
         }
       });
       saveEntries(entries);
-      toast(`Pulled ${merged} new`);
+
+      const dRes = await fetch(sbUrl(settings.dailyTable, `select=*${uf ? '&' + uf : ''}`), { headers: sbHeaders() });
+      if (!dRes.ok) throw new Error(`daily ${dRes.status}`);
+      const dRows = await dRes.json();
+      let mergedD = 0;
+      dRows.forEach((r) => {
+        const remote = r.payload || {
+          bodyWeight: r.body_weight || '', energy: r.energy || '',
+          painStrain: r.pain_strain || '', notes: r.notes || '',
+          updatedAt: r.updated_at ? new Date(r.updated_at).getTime() : 0
+        };
+        const cur = daily[r.date];
+        if (!cur || (remote.updatedAt || 0) > (cur.updatedAt || 0)) {
+          daily[r.date] = remote;
+          mergedD++;
+        }
+      });
+      saveDaily(daily);
+
+      const total = mergedE + mergedD;
+      setSyncStatus('ok', total ? `Pulled ${total} updates` : 'Up to date');
+      if (!opts.silent) toast(total ? `Pulled ${total}` : 'Already up to date');
       render();
-    } catch (e) { toast('Cloud pull failed'); }
+      return { ok: true, mergedE, mergedD };
+    } catch (e) {
+      setSyncStatus('error', String(e && e.message || e));
+      if (!opts.silent) toast('Cloud pull failed');
+      return { ok: false, reason: String(e && e.message || e) };
+    }
   }
 
   async function syncCloudPushAll() {
     if (!cloudReady()) { toast('Add Supabase URL and key in App tab'); return; }
+    setSyncStatus('syncing', 'Pushing all…');
     try {
-      const body = entries.map((e) => ({
-        entry_key: e.key,
-        user_id: settings.userId || null,
-        date: e.date,
-        day_id: e.dayId,
-        exercise_code: e.exerciseCode,
-        week: e.week,
-        payload: e,
-        updated_at: new Date(e.updatedAt || Date.now()).toISOString()
-      }));
-      const res = await fetch(`${settings.supabaseUrl}/rest/v1/${settings.supabaseTable}`, {
-        method: 'POST',
-        headers: {
-          'apikey': settings.supabaseAnonKey,
-          'Authorization': `Bearer ${settings.supabaseAnonKey}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'resolution=merge-duplicates,return=minimal'
-        },
-        body: JSON.stringify(body)
+      if (entries.length) {
+        const body = entries.map((e) => ({
+          entry_key: e.key,
+          user_id: settings.userId || null,
+          date: e.date,
+          day_id: e.dayId,
+          exercise_code: e.exerciseCode,
+          week: e.week,
+          payload: e,
+          updated_at: new Date(e.updatedAt || Date.now()).toISOString()
+        }));
+        const res = await fetch(sbUrl(settings.supabaseTable), {
+          method: 'POST',
+          headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify(body)
+        });
+        if (!res.ok) throw new Error(`entries ${res.status}`);
+      }
+      const dailyRows = Object.keys(daily).map((date) => {
+        const d = daily[date];
+        return {
+          date,
+          user_id: settings.userId || null,
+          body_weight: d.bodyWeight || null,
+          energy: d.energy || null,
+          pain_strain: d.painStrain || null,
+          notes: d.notes || null,
+          payload: Object.assign({ date }, d),
+          updated_at: new Date(d.updatedAt || Date.now()).toISOString()
+        };
       });
-      if (!res.ok) throw new Error('push');
-      toast(`Pushed ${entries.length}`);
-    } catch (e) { toast('Cloud push failed'); }
+      if (dailyRows.length) {
+        const res = await fetch(sbUrl(settings.dailyTable), {
+          method: 'POST',
+          headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify(dailyRows)
+        });
+        if (!res.ok) throw new Error(`daily ${res.status}`);
+      }
+      setSyncStatus('ok', `Pushed ${entries.length + dailyRows.length}`);
+      toast(`Pushed ${entries.length + dailyRows.length}`);
+    } catch (e) {
+      setSyncStatus('error', String(e && e.message || e));
+      toast('Cloud push failed');
+    }
+  }
+
+  async function testCloudConnection() {
+    if (!cloudReady()) { toast('Fill all 3 required fields first'); return false; }
+    setSyncStatus('syncing', 'Testing…');
+    try {
+      // HEAD request returns row count via Content-Range header — also validates RLS+key+table
+      const res = await fetch(sbUrl(settings.supabaseTable, 'select=entry_key&limit=1'), {
+        headers: sbHeaders({ 'Range-Unit': 'items', 'Range': '0-0' })
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`${res.status} ${txt.slice(0, 120)}`);
+      }
+      const res2 = await fetch(sbUrl(settings.dailyTable, 'select=date&limit=1'), {
+        headers: sbHeaders({ 'Range-Unit': 'items', 'Range': '0-0' })
+      });
+      if (!res2.ok) {
+        const txt = await res2.text();
+        throw new Error(`daily: ${res2.status} ${txt.slice(0, 120)}`);
+      }
+      setSyncStatus('ok', 'Connection OK');
+      toast('Connected ✓');
+      return true;
+    } catch (e) {
+      setSyncStatus('error', String(e && e.message || e));
+      toast('Connection failed');
+      return false;
+    }
   }
 
   // ---------- Export / Import ----------
@@ -806,30 +965,60 @@
     ]);
     view.appendChild(data);
 
-    // Cloud
-    const cloud = el('div', { class: 'card' }, [
-      el('div', { class: 'card-title' }, ['Cloud sync (optional)']),
-      el('div', { class: 'muted', style: 'font-size:13px;margin-bottom:10px' }, ['Optional Supabase backup. Local storage is the source of truth.']),
+    // Cloud — sync across devices
+    const cloud = el('div', { class: 'card' });
+    const cloudHead = el('div', { class: 'card-title' }, [
+      el('span', null, ['Sync across devices']),
       (function() {
-        const stack = el('div', { class: 'stack' });
-        const fields = [
-          { k: 'supabaseUrl', label: 'Supabase URL', placeholder: 'https://xxxx.supabase.co' },
-          { k: 'supabaseAnonKey', label: 'Anon key', placeholder: 'eyJhbGc…' },
-          { k: 'supabaseTable', label: 'Table name', placeholder: 'workout_entries' },
-          { k: 'userId', label: 'User id (optional)', placeholder: 'm.tucker' }
-        ];
-        fields.forEach((f) => {
-          const inp = el('input', { type: 'text', placeholder: f.placeholder, value: settings[f.k] || '' });
-          inp.oninput = () => { settings[f.k] = inp.value; save(STORAGE.settings, settings); };
-          stack.appendChild(el('div', null, [el('span', { class: 'label' }, [f.label]), inp]));
+        const badge = el('span', { class: `sync-badge sync-${syncStatus}` }, [syncStatusLabel()]);
+        onSyncChange(() => {
+          badge.className = `sync-badge sync-${syncStatus}`;
+          badge.textContent = syncStatusLabel();
         });
-        stack.appendChild(el('div', { class: 'row' }, [
-          el('button', { class: 'ghost', onclick: syncCloudPull }, ['Pull from cloud']),
-          el('button', { class: 'primary', onclick: syncCloudPushAll }, ['Push all to cloud'])
-        ]));
-        return stack;
+        return badge;
       })()
     ]);
+    cloud.appendChild(cloudHead);
+    cloud.appendChild(el('div', { class: 'muted', style: 'font-size:13px;margin-bottom:10px' }, [
+      'Free Supabase keeps your iPhone, MacBook, and Mac Studio in sync. Local storage stays the source of truth — cloud is the backup.'
+    ]));
+
+    const stack = el('div', { class: 'stack' });
+    const fields = [
+      { k: 'supabaseUrl', label: 'Project URL', placeholder: 'https://xxxx.supabase.co', required: true },
+      { k: 'supabaseAnonKey', label: 'Anon (public) key', placeholder: 'eyJhbGc…', required: true, type: 'password' },
+      { k: 'supabaseTable', label: 'Entries table', placeholder: 'workout_entries' },
+      { k: 'dailyTable', label: 'Daily metrics table', placeholder: 'workout_daily' },
+      { k: 'userId', label: 'User id (optional, multi-user only)', placeholder: 'melvin' }
+    ];
+    fields.forEach((f) => {
+      const inp = el('input', { type: f.type || 'text', placeholder: f.placeholder, value: settings[f.k] || '', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+      inp.oninput = () => { settings[f.k] = inp.value.trim(); save(STORAGE.settings, settings); };
+      const labelText = f.required ? `${f.label} *` : f.label;
+      stack.appendChild(el('div', null, [el('span', { class: 'label' }, [labelText]), inp]));
+    });
+
+    // Auto-sync toggle
+    const autoRow = el('label', { class: 'switch-row' });
+    const autoCb = el('input', { type: 'checkbox' });
+    autoCb.checked = !!settings.autoSync;
+    autoCb.onchange = () => { settings.autoSync = autoCb.checked; save(STORAGE.settings, settings); };
+    autoRow.appendChild(autoCb);
+    autoRow.appendChild(el('span', null, ['Auto-sync changes (recommended)']));
+    stack.appendChild(autoRow);
+
+    cloud.appendChild(stack);
+
+    cloud.appendChild(el('div', { class: 'row', style: 'margin-top:10px' }, [
+      el('button', { class: 'ghost', onclick: testCloudConnection }, ['Test connection']),
+      el('button', { class: 'ghost', onclick: () => syncCloudPull() }, ['Pull now']),
+      el('button', { class: 'primary', onclick: syncCloudPushAll }, ['Push all'])
+    ]));
+
+    cloud.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-top:10px;line-height:1.5' }, [
+      el('strong', null, ['Setup: ']),
+      'In Supabase → SQL Editor, run the schema in README.md once. Paste your Project URL and anon key above. Tap Test connection. Done — every change syncs in the background.'
+    ]));
     view.appendChild(cloud);
 
     // Install
@@ -851,6 +1040,14 @@
     ]));
   }
 
+  function syncStatusLabel() {
+    if (!cloudReady()) return 'Off';
+    if (syncStatus === 'syncing') return 'Syncing…';
+    if (syncStatus === 'ok') return syncMessage || 'Synced';
+    if (syncStatus === 'error') return 'Error';
+    return 'Ready';
+  }
+
   // ---------- Router ----------
   function render() {
     renderWeekSelect();
@@ -866,8 +1063,20 @@
   // initial render
   render();
 
-  // refresh date-based UI when app comes back to foreground
+  // Initial cloud pull on load (silent) so devices receive newer data
+  if (cloudReady() && settings.autoSync) {
+    syncCloudPull({ silent: true });
+  }
+
+  // refresh date-based UI when app comes back to foreground; also pull cloud changes
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) render();
+    if (!document.hidden) {
+      render();
+      if (cloudReady() && settings.autoSync) syncCloudPull({ silent: true });
+    }
   });
+
+  // Flush any pending writes when tab is hidden / app backgrounded
+  window.addEventListener('pagehide', () => { if (pendingEntries.size || pendingDaily.size) flushPending(); });
+  window.addEventListener('online', () => { if (cloudReady()) { flushPending(); syncCloudPull({ silent: true }); } });
 })();

@@ -42,14 +42,27 @@ icons/                     — PWA + apple-touch-icon
 - `wlog.state.v1` — UI state (current tab/day/week)
 - `wlog.settings.v1` — optional cloud sync settings
 
-Each entry stores set-by-set `weight`, `reps`, `rpe`, `done`, plus session-level `bodyWeight`, `energy`, `painStrain`, `notes`.
+- `wlog.daily.v1` — daily metrics keyed by date (body weight, energy, pain/strain, daily note)
 
-## Optional cloud sync (Supabase)
+Each entry stores set-by-set `weight`, `reps`, `rpe`, `done`. Daily metrics are stored once per date in `wlog.daily.v1`.
 
-If you want cross-device sync, create a Supabase project and a table:
+## Cross-device sync (Supabase)
+
+The app syncs your iPhone, MacBook, and Mac Studio in the background once you connect a free Supabase project. Local storage stays the source of truth; cloud is the backup that fans out to every device.
+
+### One-time setup (~5 minutes)
+
+**1. Create the project**
+- Go to [supabase.com](https://supabase.com) → sign in with GitHub → **New project**.
+- Pick a name (e.g. `workout-log`), set a DB password, choose the closest region (US-West for Scottsdale/Michigan).
+- Wait ~1 min for it to provision.
+
+**2. Run the schema**
+- In your project, open **SQL Editor** → **New query** → paste this and click **Run**:
 
 ```sql
-create table workout_entries (
+-- Entries: one row per (date, day, exercise, week)
+create table if not exists workout_entries (
   entry_key text primary key,
   user_id text,
   date date,
@@ -59,11 +72,53 @@ create table workout_entries (
   payload jsonb,
   updated_at timestamptz default now()
 );
+
+-- Daily metrics: one row per date
+create table if not exists workout_daily (
+  date date primary key,
+  user_id text,
+  body_weight numeric,
+  energy int,
+  pain_strain int,
+  notes text,
+  payload jsonb,
+  updated_at timestamptz default now()
+);
+
+-- Enable RLS but allow the anon key to read/write
+-- (single-user setup; data is gated by your anon key staying private)
+alter table workout_entries enable row level security;
+alter table workout_daily enable row level security;
+
+create policy "anon all entries" on workout_entries for all
+  using (true) with check (true);
+create policy "anon all daily" on workout_daily for all
+  using (true) with check (true);
 ```
 
-Then in the **App** tab, paste your project URL, anon key, and table name. Use **Push all** to upload local logs and **Pull from cloud** to merge remote changes (newest `updatedAt` wins).
+**3. Copy your credentials**
+- Open **Project Settings → API** (or **Data API**).
+- Copy **Project URL** (looks like `https://abcdxyz.supabase.co`).
+- Copy **anon (public) key** — the long `eyJ...` string. **Do not** copy the service_role key.
 
-> Local storage remains the source of truth; cloud is optional backup/sync.
+**4. Connect the app**
+- Open the app → **App** tab → *Sync across devices*.
+- Paste Project URL and Anon key. Leave table names as defaults.
+- Tap **Test connection** — you should see `Connected ✓`.
+- Tap **Push all** once to seed the cloud with your existing logs.
+
+**5. Repeat on every other device**
+- Open the same live URL, paste the same Project URL + anon key.
+- The app will pull existing data automatically. From here on, every change syncs in the background.
+
+### How sync works
+
+- **Auto-sync on edit** — changes are batched and pushed ~0.8s after you stop typing.
+- **Auto-pull on app open / foreground / network reconnect** — silent, no toast.
+- **Newest `updatedAt` wins** for both entries and daily metrics.
+- **Pull now / Push all** in the App tab let you force a sync on demand.
+- **Auto-sync toggle** lets you go local-only if needed.
+- Status badge in the App tab shows `Synced`, `Syncing…`, or `Error`.
 
 ## Deployment (GitHub Pages)
 
