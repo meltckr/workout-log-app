@@ -8,10 +8,13 @@
     state: 'wlog.state.v1',
     entries: 'wlog.entries.v1',
     settings: 'wlog.settings.v1',
-    daily: 'wlog.daily.v1'
+    daily: 'wlog.daily.v1',
+    outbox: 'wlog.outbox.v1',     // durable write queue, survives app kills
+    syncMeta: 'wlog.syncMeta.v1', // { deviceId, lastWatermark }
+    tombstones: 'wlog.tombstones.v1'
   };
 
-  const APP_VERSION = '1.3.0';
+  const APP_VERSION = '1.4.0';
 
   // ---------- State ----------
   const defaultState = {
@@ -27,8 +30,15 @@
     supabaseTable: 'workout_entries',
     dailyTable: 'workout_daily',
     userId: '',
-    autoSync: true
+    autoSync: true,
+    realtimeSync: true   // websocket realtime; falls back to polling
   };
+
+  // Device id: stable per browser install, used to ignore self-echoes from realtime
+  function uuid() {
+    if (crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'd_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
 
   function load(key, fallback) {
     try {
@@ -63,6 +73,33 @@
   let settings = load(STORAGE.settings, defaultSettings);
   let entries = loadEntries();
   let daily = loadDaily(); // { 'YYYY-MM-DD': { bodyWeight, energy, painStrain, notes, updatedAt } }
+
+  // Sync meta: device id + watermark (last server timestamp seen, ISO string)
+  let syncMeta = load(STORAGE.syncMeta, { deviceId: '', lastWatermarkEntries: '1970-01-01T00:00:00Z', lastWatermarkDaily: '1970-01-01T00:00:00Z' });
+  if (!syncMeta.deviceId) { syncMeta.deviceId = uuid(); save(STORAGE.syncMeta, syncMeta); }
+
+  // Tombstones: { entries: { entry_key: { deleted_at, version } }, daily: { date: { deleted_at, version } } }
+  let tombstones = load(STORAGE.tombstones, { entries: {}, daily: {} });
+  function saveTombstones() { save(STORAGE.tombstones, tombstones); }
+
+  // Outbox: durable queue of pending writes. Each item: { id, op, table, key, payload, attempts, queued_at }
+  function loadOutbox() {
+    try { return JSON.parse(localStorage.getItem(STORAGE.outbox) || '[]'); } catch (_) { return []; }
+  }
+  function saveOutbox(arr) {
+    try { localStorage.setItem(STORAGE.outbox, JSON.stringify(arr)); } catch (_) {}
+  }
+  let outbox = loadOutbox();
+  function enqueue(item) {
+    item.id = item.id || uuid();
+    item.queued_at = item.queued_at || Date.now();
+    item.attempts = item.attempts || 0;
+    // Coalesce: if a queued write for the same table+key exists, replace it (latest payload wins locally).
+    const i = outbox.findIndex((x) => x.table === item.table && x.key === item.key);
+    if (i >= 0) outbox[i] = item; else outbox.push(item);
+    saveOutbox(outbox);
+    scheduleDrain();
+  }
 
   function getDaily(date) {
     return daily[date] || { bodyWeight: '', energy: '', painStrain: '', notes: '' };
@@ -147,6 +184,20 @@
   function deleteEntry(key) {
     entries = entries.filter((e) => e.key !== key);
     saveEntries(entries);
+    // Tombstone so other devices don't resurrect it on next sync
+    tombstones.entries[key] = { deleted_at: new Date().toISOString(), version: Date.now() };
+    saveTombstones();
+    if (cloudReady() && settings.autoSync) {
+      enqueue({ op: 'delete', table: settings.supabaseTable, key, payload: { entry_key: key } });
+    }
+  }
+  function deleteDaily(date) {
+    if (daily[date]) { delete daily[date]; saveDaily(daily); }
+    tombstones.daily[date] = { deleted_at: new Date().toISOString(), version: Date.now() };
+    saveTombstones();
+    if (cloudReady() && settings.autoSync) {
+      enqueue({ op: 'delete', table: settings.dailyTable, key: date, payload: { date } });
+    }
   }
 
   function setState(patch) {
@@ -165,8 +216,11 @@
     toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
   }
 
-  // ---------- Cloud sync (optional) ----------
-  // Status: 'idle' | 'syncing' | 'ok' | 'error' | 'off'
+  // ---------- Cloud sync (bulletproof) ----------
+  // Server is the clock. Conflict order: (version DESC, server_updated_at DESC).
+  // Writes go to a durable outbox; reads use an incremental watermark.
+  //
+  // Status: 'off' | 'syncing' | 'ok' | 'error' | 'queued'
   let syncStatus = 'off';
   let syncMessage = '';
   let syncListeners = [];
@@ -178,7 +232,7 @@
   function onSyncChange(fn) { syncListeners.push(fn); return () => { syncListeners = syncListeners.filter((x) => x !== fn); }; }
 
   function cloudReady() {
-    return !!(settings.supabaseUrl && settings.supabaseAnonKey && settings.supabaseTable);
+    return !!(settings.supabaseUrl && settings.supabaseAnonKey && settings.supabaseTable && settings.dailyTable);
   }
   function sbHeaders(extra) {
     return Object.assign({
@@ -191,82 +245,229 @@
     return `${base}/rest/v1/${table}${qs ? '?' + qs : ''}`;
   }
   function userFilter() {
-    // user_id is nullable. If user provided one, scope reads/writes to it.
     return settings.userId ? `user_id=eq.${encodeURIComponent(settings.userId)}` : '';
   }
 
-  // Debounced auto-push, batches multiple quick edits into a single round-trip
-  const pendingEntries = new Map(); // key -> entry
-  const pendingDaily = new Map();   // date -> daily row
-  let pushTimer = null;
-  function scheduleAutoPush() {
-    if (!settings.autoSync || !cloudReady()) return;
-    if (pushTimer) clearTimeout(pushTimer);
-    pushTimer = setTimeout(flushPending, 800);
-  }
-  async function flushPending() {
-    if (!cloudReady()) return;
-    const eBatch = Array.from(pendingEntries.values());
-    const dBatch = Array.from(pendingDaily.values());
-    pendingEntries.clear();
-    pendingDaily.clear();
-    if (eBatch.length === 0 && dBatch.length === 0) return;
-    setSyncStatus('syncing', 'Saving to cloud…');
+  // Fetch with timeout so a flaky network never hangs the queue forever
+  async function sbFetch(url, opts, timeoutMs) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs || 12000);
     try {
-      if (eBatch.length) {
-        const body = eBatch.map((e) => ({
-          entry_key: e.key,
-          user_id: settings.userId || null,
-          date: e.date,
-          day_id: e.dayId,
-          exercise_code: e.exerciseCode,
-          week: e.week,
-          payload: e,
-          updated_at: new Date(e.updatedAt || Date.now()).toISOString()
-        }));
-        const res = await fetch(sbUrl(settings.supabaseTable), {
-          method: 'POST',
-          headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-          body: JSON.stringify(body)
+      const res = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+      return res;
+    } finally { clearTimeout(t); }
+  }
+
+  // ----- Outbox (durable write queue) -----
+  // Items: { id, op:'upsert'|'delete', table, key, payload, attempts, queued_at, next_attempt }
+  let drainTimer = null;
+  let draining = false;
+  function scheduleDrain(delay) {
+    if (drainTimer) clearTimeout(drainTimer);
+    drainTimer = setTimeout(drainOutbox, delay != null ? delay : 400);
+  }
+  function backoffMs(attempts) {
+    // 1s, 3s, 7s, 15s, capped at 60s; jittered ±25%
+    const base = Math.min(60000, 1000 * (Math.pow(2, attempts) - 1));
+    const jitter = base * (0.75 + Math.random() * 0.5);
+    return Math.max(1000, jitter);
+  }
+
+  async function drainOutbox() {
+    if (draining) return;
+    if (!cloudReady()) return;
+    if (!settings.autoSync) return;
+    if (!navigator.onLine) { setSyncStatus('queued', `Offline · ${outbox.length} queued`); return; }
+    draining = true;
+    setSyncStatus('syncing', `Syncing ${outbox.length}…`);
+    try {
+      // Group items by op+table so we can batch upserts in one POST per table
+      const upsertByTable = new Map();   // table -> [items]
+      const deletes = [];                // [{table, key, payload}]
+      const now = Date.now();
+      outbox.forEach((it) => {
+        if (it.next_attempt && it.next_attempt > now) return; // still in backoff
+        if (it.op === 'delete') deletes.push(it);
+        else {
+          if (!upsertByTable.has(it.table)) upsertByTable.set(it.table, []);
+          upsertByTable.get(it.table).push(it);
+        }
+      });
+
+      const succeededIds = new Set();
+      const failedItems = [];
+
+      // Upserts: one batched POST per table with merge-duplicates
+      for (const [table, items] of upsertByTable) {
+        const body = items.map((it) => {
+          const p = Object.assign({}, it.payload);
+          // Stamp client metadata used by the trigger to set server fields
+          p.client_updated_at = new Date(it.queued_at).toISOString();
+          p.client_device_id = syncMeta.deviceId;
+          return p;
         });
-        if (!res.ok) throw new Error(`entries ${res.status}`);
+        try {
+          const res = await sbFetch(sbUrl(table), {
+            method: 'POST',
+            headers: sbHeaders({
+              'Content-Type': 'application/json',
+              'Prefer': 'resolution=merge-duplicates,return=minimal'
+            }),
+            body: JSON.stringify(body)
+          });
+          if (!res.ok) {
+            const txt = await res.text();
+            throw new Error(`${table} ${res.status}: ${txt.slice(0,120)}`);
+          }
+          items.forEach((it) => succeededIds.add(it.id));
+        } catch (e) {
+          items.forEach((it) => failedItems.push({ it, err: e }));
+        }
       }
-      if (dBatch.length) {
-        const body = dBatch.map((d) => ({
-          date: d.date,
-          user_id: settings.userId || null,
-          body_weight: d.bodyWeight || null,
-          energy: d.energy || null,
-          pain_strain: d.painStrain || null,
-          notes: d.notes || null,
-          payload: d,
-          updated_at: new Date(d.updatedAt || Date.now()).toISOString()
-        }));
-        const res = await fetch(sbUrl(settings.dailyTable), {
-          method: 'POST',
-          headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-          body: JSON.stringify(body)
+
+      // Deletes: soft-delete via UPSERT with deleted=true so tombstones replicate cleanly
+      if (deletes.length) {
+        const byTable = new Map();
+        deletes.forEach((it) => {
+          if (!byTable.has(it.table)) byTable.set(it.table, []);
+          const tomb = it.table === settings.supabaseTable
+            ? tombstones.entries[it.key]
+            : tombstones.daily[it.key];
+          const row = it.table === settings.supabaseTable
+            ? { entry_key: it.key, user_id: settings.userId || null, deleted: true,
+                client_version: (tomb && tomb.version) || Date.now(),
+                client_device_id: syncMeta.deviceId,
+                client_updated_at: (tomb && tomb.deleted_at) || new Date().toISOString() }
+            : { date: it.key, user_id: settings.userId || null, deleted: true,
+                client_version: (tomb && tomb.version) || Date.now(),
+                client_device_id: syncMeta.deviceId,
+                client_updated_at: (tomb && tomb.deleted_at) || new Date().toISOString() };
+          byTable.get(it.table).push({ it, row });
         });
-        if (!res.ok) throw new Error(`daily ${res.status}`);
+        for (const [table, items] of byTable) {
+          try {
+            const res = await sbFetch(sbUrl(table), {
+              method: 'POST',
+              headers: sbHeaders({
+                'Content-Type': 'application/json',
+                'Prefer': 'resolution=merge-duplicates,return=minimal'
+              }),
+              body: JSON.stringify(items.map((x) => x.row))
+            });
+            if (!res.ok) {
+              const txt = await res.text();
+              throw new Error(`${table} tombstone ${res.status}: ${txt.slice(0,120)}`);
+            }
+            items.forEach((x) => succeededIds.add(x.it.id));
+          } catch (e) {
+            items.forEach((x) => failedItems.push({ it: x.it, err: e }));
+          }
+        }
       }
-      setSyncStatus('ok', `Synced ${eBatch.length + dBatch.length}`);
-    } catch (e) {
-      // Re-queue so we retry on next change
-      eBatch.forEach((x) => pendingEntries.set(x.key, x));
-      dBatch.forEach((x) => pendingDaily.set(x.date, x));
-      setSyncStatus('error', String(e && e.message || e));
+
+      // Update outbox: remove successes, bump attempts on failures
+      const next = [];
+      outbox.forEach((it) => {
+        if (succeededIds.has(it.id)) return;
+        const failed = failedItems.find((f) => f.it.id === it.id);
+        if (failed) {
+          it.attempts = (it.attempts || 0) + 1;
+          it.last_error = String(failed.err && failed.err.message || failed.err);
+          it.next_attempt = Date.now() + backoffMs(it.attempts);
+        }
+        next.push(it);
+      });
+      outbox = next;
+      saveOutbox(outbox);
+
+      if (outbox.length === 0) {
+        setSyncStatus('ok', 'Synced');
+      } else {
+        const errs = outbox.filter((x) => x.last_error).length;
+        if (errs) setSyncStatus('error', `${errs} failed · will retry`);
+        else setSyncStatus('queued', `${outbox.length} queued`);
+        // Schedule the next attempt at the earliest next_attempt
+        const earliest = outbox.reduce((m, x) => Math.min(m, x.next_attempt || Date.now()), Infinity);
+        scheduleDrain(Math.max(500, earliest - Date.now()));
+      }
+    } finally {
+      draining = false;
     }
   }
 
+  // ----- Public-ish helpers wired to UI/state -----
   function maybeSyncCloud(entry) {
-    if (!settings.autoSync || !cloudReady()) return;
-    pendingEntries.set(entry.key, entry);
-    scheduleAutoPush();
+    if (!cloudReady() || !settings.autoSync) return;
+    enqueue({
+      op: 'upsert',
+      table: settings.supabaseTable,
+      key: entry.key,
+      payload: {
+        entry_key: entry.key,
+        user_id: settings.userId || null,
+        date: entry.date,
+        day_id: entry.dayId,
+        exercise_code: entry.exerciseCode,
+        week: entry.week,
+        payload: entry,
+        client_version: entry.updatedAt || Date.now()
+      }
+    });
   }
   function maybeSyncDaily(date, row) {
-    if (!settings.autoSync || !cloudReady()) return;
-    pendingDaily.set(date, Object.assign({ date }, row));
-    scheduleAutoPush();
+    if (!cloudReady() || !settings.autoSync) return;
+    enqueue({
+      op: 'upsert',
+      table: settings.dailyTable,
+      key: date,
+      payload: {
+        date,
+        user_id: settings.userId || null,
+        body_weight: row.bodyWeight === '' ? null : Number(row.bodyWeight) || null,
+        energy: row.energy === '' ? null : parseInt(row.energy, 10) || null,
+        pain_strain: row.painStrain === '' ? null : parseInt(row.painStrain, 10) || null,
+        notes: row.notes || null,
+        payload: Object.assign({ date }, row),
+        client_version: row.updatedAt || Date.now()
+      }
+    });
+  }
+
+  // ----- Incremental pull with watermark -----
+  // We page through results so a long offline gap can't time out a single request.
+  async function pullTable(tableKey, watermarkKey, applyRow, applyTombstone) {
+    const table = settings[tableKey];
+    let watermark = syncMeta[watermarkKey] || '1970-01-01T00:00:00Z';
+    let merged = 0, tomb = 0;
+    let page = 0;
+    while (true) {
+      const uf = userFilter();
+      const wmEnc = encodeURIComponent(watermark);
+      const qs = `select=*&server_updated_at=gt.${wmEnc}&order=server_updated_at.asc&limit=500${uf ? '&' + uf : ''}`;
+      const res = await sbFetch(sbUrl(table, qs), { headers: sbHeaders() }, 20000);
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`${table} pull ${res.status}: ${txt.slice(0,120)}`);
+      }
+      const rows = await res.json();
+      if (!rows.length) break;
+      rows.forEach((r) => {
+        if (r.deleted) {
+          if (applyTombstone(r)) tomb++;
+        } else {
+          if (applyRow(r)) merged++;
+        }
+        // Track the latest server time we've successfully consumed
+        if (r.server_updated_at && r.server_updated_at > watermark) watermark = r.server_updated_at;
+      });
+      // Persist watermark progress after every page so a crash mid-pull doesn't redo work
+      syncMeta[watermarkKey] = watermark;
+      save(STORAGE.syncMeta, syncMeta);
+      page++;
+      if (rows.length < 500) break;
+      if (page > 40) break; // 20k row safety cap per pull
+    }
+    return { merged, tomb };
   }
 
   async function syncCloudPull(opts) {
@@ -275,134 +476,220 @@
       if (!opts.silent) toast('Add Supabase URL and key in App tab');
       return { ok: false, reason: 'not-configured' };
     }
-    setSyncStatus('syncing', 'Pulling from cloud…');
+    setSyncStatus('syncing', 'Pulling…');
     try {
-      const uf = userFilter();
-      const eRes = await fetch(sbUrl(settings.supabaseTable, `select=*${uf ? '&' + uf : ''}`), { headers: sbHeaders() });
-      if (!eRes.ok) throw new Error(`entries ${eRes.status}`);
-      const eRows = await eRes.json();
-      let mergedE = 0;
-      eRows.forEach((r) => {
-        const remote = r.payload;
-        if (!remote) return;
-        const local = entries.find((e) => e.key === r.entry_key);
-        if (!local || (remote.updatedAt || 0) > (local.updatedAt || 0)) {
+      const eRes = await pullTable('supabaseTable', 'lastWatermarkEntries',
+        (r) => {
+          // Skip our own writes that are still in the outbox waiting for ack
+          if (r.client_device_id === syncMeta.deviceId && outbox.some((o) => o.table === settings.supabaseTable && o.key === r.entry_key)) return false;
+          // Honor local tombstone if it's newer than the remote
+          const tomb = tombstones.entries[r.entry_key];
+          if (tomb && new Date(tomb.deleted_at).getTime() > new Date(r.server_updated_at).getTime()) return false;
+          const remote = r.payload || {};
           remote.key = r.entry_key;
-          const idx = entries.findIndex((e) => e.key === remote.key);
-          if (idx >= 0) entries[idx] = remote; else entries.push(remote);
-          mergedE++;
+          // Compare by client_version (server preserves it for tie-breaking)
+          const local = entries.find((e) => e.key === r.entry_key);
+          const lv = (local && local.updatedAt) || 0;
+          const rv = r.client_version || 0;
+          if (!local || rv > lv || (rv === lv && r.server_updated_at > (local._server_updated_at || ''))) {
+            remote._server_updated_at = r.server_updated_at;
+            const idx = entries.findIndex((e) => e.key === r.entry_key);
+            if (idx >= 0) entries[idx] = remote; else entries.push(remote);
+            return true;
+          }
+          return false;
+        },
+        (r) => {
+          const idx = entries.findIndex((e) => e.key === r.entry_key);
+          if (idx >= 0) { entries.splice(idx, 1); }
+          tombstones.entries[r.entry_key] = { deleted_at: r.server_updated_at, version: r.client_version || Date.now() };
+          return true;
         }
-      });
-      saveEntries(entries);
+      );
+      saveEntries(entries); saveTombstones();
 
-      const dRes = await fetch(sbUrl(settings.dailyTable, `select=*${uf ? '&' + uf : ''}`), { headers: sbHeaders() });
-      if (!dRes.ok) throw new Error(`daily ${dRes.status}`);
-      const dRows = await dRes.json();
-      let mergedD = 0;
-      dRows.forEach((r) => {
-        const remote = r.payload || {
-          bodyWeight: r.body_weight || '', energy: r.energy || '',
-          painStrain: r.pain_strain || '', notes: r.notes || '',
-          updatedAt: r.updated_at ? new Date(r.updated_at).getTime() : 0
-        };
-        const cur = daily[r.date];
-        if (!cur || (remote.updatedAt || 0) > (cur.updatedAt || 0)) {
-          daily[r.date] = remote;
-          mergedD++;
+      const dRes = await pullTable('dailyTable', 'lastWatermarkDaily',
+        (r) => {
+          if (r.client_device_id === syncMeta.deviceId && outbox.some((o) => o.table === settings.dailyTable && o.key === r.date)) return false;
+          const tomb = tombstones.daily[r.date];
+          if (tomb && new Date(tomb.deleted_at).getTime() > new Date(r.server_updated_at).getTime()) return false;
+          const remote = r.payload || {
+            bodyWeight: r.body_weight != null ? String(r.body_weight) : '',
+            energy: r.energy != null ? String(r.energy) : '',
+            painStrain: r.pain_strain != null ? String(r.pain_strain) : '',
+            notes: r.notes || '',
+            updatedAt: r.client_version || (r.server_updated_at ? new Date(r.server_updated_at).getTime() : 0)
+          };
+          const cur = daily[r.date];
+          const cv = (cur && cur.updatedAt) || 0;
+          const rv = r.client_version || 0;
+          if (!cur || rv > cv || (rv === cv && r.server_updated_at > (cur._server_updated_at || ''))) {
+            remote._server_updated_at = r.server_updated_at;
+            daily[r.date] = remote;
+            return true;
+          }
+          return false;
+        },
+        (r) => {
+          if (daily[r.date]) delete daily[r.date];
+          tombstones.daily[r.date] = { deleted_at: r.server_updated_at, version: r.client_version || Date.now() };
+          return true;
         }
-      });
-      saveDaily(daily);
+      );
+      saveDaily(daily); saveTombstones();
 
-      const total = mergedE + mergedD;
-      setSyncStatus('ok', total ? `Pulled ${total} updates` : 'Up to date');
+      const total = eRes.merged + eRes.tomb + dRes.merged + dRes.tomb;
+      if (outbox.length) setSyncStatus('queued', `${outbox.length} queued`);
+      else setSyncStatus('ok', total ? `Pulled ${total}` : 'Up to date');
       if (!opts.silent) toast(total ? `Pulled ${total}` : 'Already up to date');
       render();
-      return { ok: true, mergedE, mergedD };
+      return { ok: true, ...eRes, daily: dRes };
     } catch (e) {
       setSyncStatus('error', String(e && e.message || e));
-      if (!opts.silent) toast('Cloud pull failed');
+      if (!opts.silent) toast('Pull failed · will retry');
+      // Schedule another attempt
+      setTimeout(() => { if (cloudReady() && settings.autoSync) syncCloudPull({ silent: true }); }, 5000);
       return { ok: false, reason: String(e && e.message || e) };
     }
   }
 
   async function syncCloudPushAll() {
     if (!cloudReady()) { toast('Add Supabase URL and key in App tab'); return; }
-    setSyncStatus('syncing', 'Pushing all…');
-    try {
-      if (entries.length) {
-        const body = entries.map((e) => ({
-          entry_key: e.key,
-          user_id: settings.userId || null,
-          date: e.date,
-          day_id: e.dayId,
-          exercise_code: e.exerciseCode,
-          week: e.week,
-          payload: e,
-          updated_at: new Date(e.updatedAt || Date.now()).toISOString()
-        }));
-        const res = await fetch(sbUrl(settings.supabaseTable), {
-          method: 'POST',
-          headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-          body: JSON.stringify(body)
-        });
-        if (!res.ok) throw new Error(`entries ${res.status}`);
+    // Re-enqueue everything (idempotent because outbox coalesces by key)
+    entries.forEach((e) => maybeSyncCloud(e));
+    Object.keys(daily).forEach((date) => maybeSyncDaily(date, daily[date]));
+    // Also re-emit tombstones in case server lost them
+    Object.keys(tombstones.entries).forEach((k) => {
+      if (!entries.find((e) => e.key === k)) {
+        enqueue({ op: 'delete', table: settings.supabaseTable, key: k, payload: { entry_key: k } });
       }
-      const dailyRows = Object.keys(daily).map((date) => {
-        const d = daily[date];
-        return {
-          date,
-          user_id: settings.userId || null,
-          body_weight: d.bodyWeight || null,
-          energy: d.energy || null,
-          pain_strain: d.painStrain || null,
-          notes: d.notes || null,
-          payload: Object.assign({ date }, d),
-          updated_at: new Date(d.updatedAt || Date.now()).toISOString()
-        };
-      });
-      if (dailyRows.length) {
-        const res = await fetch(sbUrl(settings.dailyTable), {
-          method: 'POST',
-          headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-          body: JSON.stringify(dailyRows)
-        });
-        if (!res.ok) throw new Error(`daily ${res.status}`);
-      }
-      setSyncStatus('ok', `Pushed ${entries.length + dailyRows.length}`);
-      toast(`Pushed ${entries.length + dailyRows.length}`);
-    } catch (e) {
-      setSyncStatus('error', String(e && e.message || e));
-      toast('Cloud push failed');
-    }
+    });
+    Object.keys(tombstones.daily).forEach((d) => {
+      if (!daily[d]) enqueue({ op: 'delete', table: settings.dailyTable, key: d, payload: { date: d } });
+    });
+    setSyncStatus('syncing', `Pushing ${outbox.length}…`);
+    await drainOutbox();
+    if (outbox.length === 0) toast('All pushed');
+    else toast(`${outbox.length} retrying`);
   }
 
   async function testCloudConnection() {
-    if (!cloudReady()) { toast('Fill all 3 required fields first'); return false; }
+    if (!cloudReady()) { toast('Fill all required fields first'); return false; }
     setSyncStatus('syncing', 'Testing…');
+    const checks = [];
     try {
-      // HEAD request returns row count via Content-Range header — also validates RLS+key+table
-      const res = await fetch(sbUrl(settings.supabaseTable, 'select=entry_key&limit=1'), {
-        headers: sbHeaders({ 'Range-Unit': 'items', 'Range': '0-0' })
-      });
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`${res.status} ${txt.slice(0, 120)}`);
+      // Validate both tables and required columns exist
+      const cols = 'entry_key,server_updated_at,client_version,client_device_id,deleted';
+      const r1 = await sbFetch(sbUrl(settings.supabaseTable, `select=${cols}&limit=1`), { headers: sbHeaders() }, 8000);
+      if (!r1.ok) {
+        const t = await r1.text();
+        throw new Error(`Entries table or schema issue: ${r1.status} — run the SQL migration in README. ${t.slice(0,100)}`);
       }
-      const res2 = await fetch(sbUrl(settings.dailyTable, 'select=date&limit=1'), {
-        headers: sbHeaders({ 'Range-Unit': 'items', 'Range': '0-0' })
-      });
-      if (!res2.ok) {
-        const txt = await res2.text();
-        throw new Error(`daily: ${res2.status} ${txt.slice(0, 120)}`);
+      checks.push('entries table OK');
+      const cols2 = 'date,server_updated_at,client_version,client_device_id,deleted';
+      const r2 = await sbFetch(sbUrl(settings.dailyTable, `select=${cols2}&limit=1`), { headers: sbHeaders() }, 8000);
+      if (!r2.ok) {
+        const t = await r2.text();
+        throw new Error(`Daily table or schema issue: ${r2.status} — run the SQL migration in README. ${t.slice(0,100)}`);
       }
-      setSyncStatus('ok', 'Connection OK');
-      toast('Connected ✓');
+      checks.push('daily table OK');
+
+      // Round-trip self-test: write a probe row, read it back, delete it, time it
+      const probeKey = `__probe__::${syncMeta.deviceId}::${Date.now()}`;
+      const t0 = performance.now();
+      const wRes = await sbFetch(sbUrl(settings.supabaseTable), {
+        method: 'POST',
+        headers: sbHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify([{
+          entry_key: probeKey,
+          user_id: settings.userId || null,
+          date: todayISO(), day_id: 'probe', exercise_code: 'P', week: 0,
+          payload: { probe: true },
+          client_version: Date.now(),
+          client_device_id: syncMeta.deviceId
+        }])
+      }, 8000);
+      if (!wRes.ok) throw new Error(`Write probe failed: ${wRes.status}`);
+      const rRes = await sbFetch(sbUrl(settings.supabaseTable, `select=*&entry_key=eq.${encodeURIComponent(probeKey)}`), { headers: sbHeaders() }, 8000);
+      if (!rRes.ok) throw new Error(`Read probe failed: ${rRes.status}`);
+      const rows = await rRes.json();
+      if (!rows.length) throw new Error('Probe row not visible after write — RLS may block reads');
+      if (!rows[0].server_updated_at) throw new Error('server_updated_at is missing — install the trigger from README');
+      const dRes = await sbFetch(sbUrl(settings.supabaseTable, `entry_key=eq.${encodeURIComponent(probeKey)}`), { method: 'DELETE', headers: sbHeaders() }, 8000);
+      if (!dRes.ok) throw new Error(`Delete probe failed: ${dRes.status}`);
+      const ms = Math.round(performance.now() - t0);
+      checks.push(`round-trip ${ms}ms`);
+
+      setSyncStatus('ok', `Diagnostics: ${checks.join(' · ')}`);
+      toast(`All checks passed · ${ms}ms round-trip`);
       return true;
     } catch (e) {
       setSyncStatus('error', String(e && e.message || e));
-      toast('Connection failed');
+      toast('Diagnostics failed — see status');
       return false;
     }
+  }
+
+  // ----- Realtime subscription (optional, falls back to polling) -----
+  let rtSocket = null;
+  let rtRetryTimer = null;
+  let rtPollTimer = null;
+  function rtConnect() {
+    if (!cloudReady() || !settings.realtimeSync) return;
+    rtDisconnect();
+    try {
+      const wsUrl = settings.supabaseUrl.replace(/^http/, 'ws') + `/realtime/v1/websocket?apikey=${encodeURIComponent(settings.supabaseAnonKey)}&vsn=1.0.0`;
+      rtSocket = new WebSocket(wsUrl);
+      let heartbeat = null;
+      rtSocket.onopen = () => {
+        // Subscribe to changes on both tables
+        const sub = (topic) => rtSocket.send(JSON.stringify({
+          topic, event: 'phx_join',
+          payload: { config: { postgres_changes: [{ event: '*', schema: 'public', table: topic.split(':').pop() }] } },
+          ref: String(Date.now())
+        }));
+        sub(`realtime:public:${settings.supabaseTable}`);
+        sub(`realtime:public:${settings.dailyTable}`);
+        heartbeat = setInterval(() => {
+          try { rtSocket.send(JSON.stringify({ topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(Date.now()) })); } catch(_) {}
+        }, 25000);
+      };
+      rtSocket.onmessage = (msg) => {
+        // Any change message → trigger a fast incremental pull
+        try {
+          const data = JSON.parse(msg.data);
+          if (data.event === 'postgres_changes' || (data.payload && data.payload.data)) {
+            // Debounce so a burst of changes only causes one pull
+            if (rtPollTimer) clearTimeout(rtPollTimer);
+            rtPollTimer = setTimeout(() => syncCloudPull({ silent: true }), 250);
+          }
+        } catch (_) {}
+      };
+      rtSocket.onclose = () => {
+        if (heartbeat) clearInterval(heartbeat);
+        // Auto-reconnect with backoff
+        if (rtRetryTimer) clearTimeout(rtRetryTimer);
+        rtRetryTimer = setTimeout(rtConnect, 5000);
+      };
+      rtSocket.onerror = () => { /* let onclose handle reconnect */ };
+    } catch (_) {
+      // If realtime can't connect at all, polling fallback below still keeps us in sync
+    }
+  }
+  function rtDisconnect() {
+    if (rtSocket) { try { rtSocket.close(); } catch(_) {} rtSocket = null; }
+    if (rtRetryTimer) { clearTimeout(rtRetryTimer); rtRetryTimer = null; }
+  }
+
+  // Always-on polling fallback: every 30s pull silently. Cheap because of watermark.
+  let pollTimer = null;
+  function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+      if (cloudReady() && settings.autoSync && !document.hidden && navigator.onLine) {
+        syncCloudPull({ silent: true });
+      }
+    }, 30000);
   }
 
   // ---------- Export / Import ----------
@@ -1002,22 +1289,51 @@
     const autoRow = el('label', { class: 'switch-row' });
     const autoCb = el('input', { type: 'checkbox' });
     autoCb.checked = !!settings.autoSync;
-    autoCb.onchange = () => { settings.autoSync = autoCb.checked; save(STORAGE.settings, settings); };
+    autoCb.onchange = () => { settings.autoSync = autoCb.checked; save(STORAGE.settings, settings); if (autoCb.checked) startSync(); };
     autoRow.appendChild(autoCb);
     autoRow.appendChild(el('span', null, ['Auto-sync changes (recommended)']));
     stack.appendChild(autoRow);
 
+    // Realtime toggle
+    const rtRow = el('label', { class: 'switch-row' });
+    const rtCb = el('input', { type: 'checkbox' });
+    rtCb.checked = !!settings.realtimeSync;
+    rtCb.onchange = () => {
+      settings.realtimeSync = rtCb.checked;
+      save(STORAGE.settings, settings);
+      if (rtCb.checked) rtConnect(); else rtDisconnect();
+    };
+    rtRow.appendChild(rtCb);
+    rtRow.appendChild(el('span', null, ['Live sync via Realtime (push notifications between devices)']));
+    stack.appendChild(rtRow);
+
     cloud.appendChild(stack);
 
+    // Live status row: queue size + device id
+    const queueLine = el('div', { class: 'muted', style: 'font-size:12px;margin-top:10px;display:flex;justify-content:space-between;gap:8px' }, [
+      el('span', null, [`Queue: ${outbox.length} pending`]),
+      el('span', null, [`Device: ${syncMeta.deviceId.slice(0, 8)}…`])
+    ]);
+    onSyncChange(() => {
+      const qSpan = queueLine.firstChild;
+      if (qSpan) qSpan.textContent = `Queue: ${outbox.length} pending`;
+    });
+    cloud.appendChild(queueLine);
+
     cloud.appendChild(el('div', { class: 'row', style: 'margin-top:10px' }, [
-      el('button', { class: 'ghost', onclick: testCloudConnection }, ['Test connection']),
+      el('button', { class: 'ghost', onclick: testCloudConnection }, ['Run diagnostics']),
       el('button', { class: 'ghost', onclick: () => syncCloudPull() }, ['Pull now']),
       el('button', { class: 'primary', onclick: syncCloudPushAll }, ['Push all'])
     ]));
 
+    // Status detail (full message, multi-line OK)
+    const statusLine = el('div', { class: 'muted', style: 'font-size:12px;margin-top:8px;word-break:break-word' }, [syncMessage || '—']);
+    onSyncChange(() => { statusLine.textContent = syncMessage || '—'; });
+    cloud.appendChild(statusLine);
+
     cloud.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-top:10px;line-height:1.5' }, [
       el('strong', null, ['Setup: ']),
-      'In Supabase → SQL Editor, run the schema in README.md once. Paste your Project URL and anon key above. Tap Test connection. Done — every change syncs in the background.'
+      'In Supabase → SQL Editor, run the schema in README.md once. Paste your Project URL and anon key above. Tap Run diagnostics. Done — every change syncs in the background.'
     ]));
     view.appendChild(cloud);
 
@@ -1042,7 +1358,8 @@
 
   function syncStatusLabel() {
     if (!cloudReady()) return 'Off';
-    if (syncStatus === 'syncing') return 'Syncing…';
+    if (syncStatus === 'syncing') return syncMessage || 'Syncing…';
+    if (syncStatus === 'queued') return syncMessage || 'Queued';
     if (syncStatus === 'ok') return syncMessage || 'Synced';
     if (syncStatus === 'error') return 'Error';
     return 'Ready';
@@ -1063,20 +1380,54 @@
   // initial render
   render();
 
-  // Initial cloud pull on load (silent) so devices receive newer data
-  if (cloudReady() && settings.autoSync) {
-    syncCloudPull({ silent: true });
+  // ---- Sync lifecycle ----
+  function startSync() {
+    if (!cloudReady()) { setSyncStatus('off', ''); return; }
+    setSyncStatus(outbox.length ? 'queued' : 'idle', outbox.length ? `${outbox.length} queued` : 'Ready');
+    // Drain any queued writes from a previous session
+    if (outbox.length && settings.autoSync) scheduleDrain(0);
+    // Initial pull
+    if (settings.autoSync) syncCloudPull({ silent: true });
+    // Realtime push
+    if (settings.realtimeSync) rtConnect();
+    // Polling backup
+    startPolling();
   }
+  startSync();
 
-  // refresh date-based UI when app comes back to foreground; also pull cloud changes
+  // Foreground: pull, then drain queue
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       render();
-      if (cloudReady() && settings.autoSync) syncCloudPull({ silent: true });
+      if (cloudReady() && settings.autoSync) {
+        syncCloudPull({ silent: true });
+        if (outbox.length) scheduleDrain(0);
+        if (settings.realtimeSync && (!rtSocket || rtSocket.readyState !== 1)) rtConnect();
+      }
     }
   });
 
-  // Flush any pending writes when tab is hidden / app backgrounded
-  window.addEventListener('pagehide', () => { if (pendingEntries.size || pendingDaily.size) flushPending(); });
-  window.addEventListener('online', () => { if (cloudReady()) { flushPending(); syncCloudPull({ silent: true }); } });
+  // Best-effort flush on backgrounding (sendBeacon would be nicer but keeps the API simple)
+  window.addEventListener('pagehide', () => { if (outbox.length && cloudReady()) drainOutbox(); });
+
+  // Network recovery: drain queue + pull
+  window.addEventListener('online', () => {
+    if (cloudReady() && settings.autoSync) {
+      scheduleDrain(0);
+      syncCloudPull({ silent: true });
+      if (settings.realtimeSync) rtConnect();
+    }
+  });
+  window.addEventListener('offline', () => {
+    setSyncStatus('queued', `Offline · ${outbox.length} queued`);
+  });
+
+  // Cross-tab: if another tab on the same browser writes, react
+  window.addEventListener('storage', (e) => {
+    if (e.key === STORAGE.entries) entries = loadEntries();
+    else if (e.key === STORAGE.daily) daily = loadDaily();
+    else if (e.key === STORAGE.outbox) outbox = loadOutbox();
+    else return;
+    render();
+  });
 })();

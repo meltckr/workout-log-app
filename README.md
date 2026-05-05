@@ -58,9 +58,11 @@ The app syncs your iPhone, MacBook, and Mac Studio in the background once you co
 - Wait ~1 min for it to provision.
 
 **2. Run the schema**
-- In your project, open **SQL Editor** → **New query** → paste this and click **Run**:
+- In your project, open **SQL Editor** → **New query** → paste this whole block and click **Run**:
 
 ```sql
+-- ===== workout-log-app schema v1.4 (bulletproof sync) =====
+
 -- Entries: one row per (date, day, exercise, week)
 create table if not exists workout_entries (
   entry_key text primary key,
@@ -70,8 +72,14 @@ create table if not exists workout_entries (
   exercise_code text,
   week int,
   payload jsonb,
-  updated_at timestamptz default now()
+  client_version bigint,            -- monotonic version supplied by client (Date.now())
+  client_device_id text,            -- which device wrote this (for ignoring self-echoes)
+  client_updated_at timestamptz,    -- when the client edited it
+  server_updated_at timestamptz default now() not null,  -- authoritative server clock
+  deleted boolean default false not null
 );
+create index if not exists workout_entries_server_updated_at_idx on workout_entries (server_updated_at);
+create index if not exists workout_entries_user_idx on workout_entries (user_id);
 
 -- Daily metrics: one row per date
 create table if not exists workout_daily (
@@ -82,18 +90,62 @@ create table if not exists workout_daily (
   pain_strain int,
   notes text,
   payload jsonb,
-  updated_at timestamptz default now()
+  client_version bigint,
+  client_device_id text,
+  client_updated_at timestamptz,
+  server_updated_at timestamptz default now() not null,
+  deleted boolean default false not null
 );
+create index if not exists workout_daily_server_updated_at_idx on workout_daily (server_updated_at);
+create index if not exists workout_daily_user_idx on workout_daily (user_id);
 
--- Enable RLS but allow the anon key to read/write
--- (single-user setup; data is gated by your anon key staying private)
+-- Trigger: server stamps server_updated_at on every change. This is the conflict tiebreaker.
+create or replace function wlog_touch() returns trigger language plpgsql as $$
+begin
+  new.server_updated_at := now();
+  return new;
+end $$;
+
+drop trigger if exists wlog_entries_touch on workout_entries;
+create trigger wlog_entries_touch before insert or update on workout_entries
+  for each row execute function wlog_touch();
+
+drop trigger if exists wlog_daily_touch on workout_daily;
+create trigger wlog_daily_touch before insert or update on workout_daily
+  for each row execute function wlog_touch();
+
+-- Row-level security: anon key has full access (single-user; treat anon key like a password)
 alter table workout_entries enable row level security;
-alter table workout_daily enable row level security;
+alter table workout_daily   enable row level security;
 
-create policy "anon all entries" on workout_entries for all
-  using (true) with check (true);
-create policy "anon all daily" on workout_daily for all
-  using (true) with check (true);
+drop policy if exists "anon all entries" on workout_entries;
+drop policy if exists "anon all daily"   on workout_daily;
+create policy "anon all entries" on workout_entries for all using (true) with check (true);
+create policy "anon all daily"   on workout_daily   for all using (true) with check (true);
+
+-- Realtime: enable change broadcasts so other devices learn instantly
+alter publication supabase_realtime add table workout_entries;
+alter publication supabase_realtime add table workout_daily;
+```
+
+Already running an older v1.3 schema? Run only the migration block below — it adds the new columns/triggers without losing data:
+
+```sql
+alter table workout_entries
+  add column if not exists client_version bigint,
+  add column if not exists client_device_id text,
+  add column if not exists client_updated_at timestamptz,
+  add column if not exists server_updated_at timestamptz default now() not null,
+  add column if not exists deleted boolean default false not null;
+alter table workout_daily
+  add column if not exists client_version bigint,
+  add column if not exists client_device_id text,
+  add column if not exists client_updated_at timestamptz,
+  add column if not exists server_updated_at timestamptz default now() not null,
+  add column if not exists deleted boolean default false not null;
+create index if not exists workout_entries_server_updated_at_idx on workout_entries (server_updated_at);
+create index if not exists workout_daily_server_updated_at_idx on workout_daily (server_updated_at);
+-- (re-run the trigger function and Realtime publication blocks above)
 ```
 
 **3. Copy your credentials**
@@ -111,14 +163,18 @@ create policy "anon all daily" on workout_daily for all
 - Open the same live URL, paste the same Project URL + anon key.
 - The app will pull existing data automatically. From here on, every change syncs in the background.
 
-### How sync works
+### How sync works (bulletproof mode)
 
-- **Auto-sync on edit** — changes are batched and pushed ~0.8s after you stop typing.
-- **Auto-pull on app open / foreground / network reconnect** — silent, no toast.
-- **Newest `updatedAt` wins** for both entries and daily metrics.
-- **Pull now / Push all** in the App tab let you force a sync on demand.
-- **Auto-sync toggle** lets you go local-only if needed.
-- Status badge in the App tab shows `Synced`, `Syncing…`, or `Error`.
+- **Server is the clock.** A Postgres trigger stamps `server_updated_at` on every write. The client never trusts its own clock for conflict resolution.
+- **Conflict order:** newer `client_version` wins; ties broken by `server_updated_at`. Same write twice is a no-op (idempotent UPSERT on primary key).
+- **Durable outbox.** Every write is queued in `localStorage` *before* the network call. App killed mid-write, airplane mode, dead WiFi — the queue survives and drains on reconnect.
+- **Exponential backoff.** Failed writes retry at 1s → 3s → 7s → 15s → … capped at 60s, with jitter.
+- **Incremental pull with watermark.** The app remembers the last `server_updated_at` it consumed and only fetches rows newer than that. Tiny payloads, fast on 5G, paginated for big offline gaps.
+- **Tombstones for deletes.** Deleting an exercise on iPhone is propagated as `deleted=true`; other devices honor it instead of resurrecting the row.
+- **Realtime push, polling backup.** Supabase Realtime gives instant cross-device updates; if the WebSocket can't connect (corporate WiFi, captive portal), a 30s background poll catches up.
+- **Self-echo suppression.** A device tags every write with its `client_device_id`; Realtime echoes of its own writes don't trigger redundant work.
+- **Cross-tab safe.** Editing in one tab is reflected in another tab on the same browser instantly via the `storage` event.
+- **Run diagnostics** in the App tab does a full write/read/delete round-trip and reports latency — if anything's wrong it tells you exactly which step failed.
 
 ## Deployment (GitHub Pages)
 

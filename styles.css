@@ -520,6 +520,7 @@ button.danger { background: transparent; border-color: var(--line-strong); color
 .sync-badge.sync-syncing { background: rgba(245,180,0,0.16); color: var(--accent); border-color: rgba(245,180,0,0.4); }
 .sync-badge.sync-error { background: rgba(220,68,68,0.16); color: #ff8a8a; border-color: rgba(220,68,68,0.4); }
 .sync-badge.sync-off, .sync-badge.sync-idle { opacity: 0.7; }
+.sync-badge.sync-queued { background: rgba(80,140,220,0.16); color: #7eb6ff; border-color: rgba(80,140,220,0.4); }
 
 /* Auto-sync toggle row */
 .switch-row {
