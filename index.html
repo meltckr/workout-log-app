@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Workout Log — M Tucker A</title>
+
+  <!-- Mobile / iOS -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="theme-color" content="#0b0c0f" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="format-detection" content="telephone=no" />
+
+  <!-- Apple PWA -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Workout Log" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <link rel="icon" href="icons/icon-192.png" type="image/png" />
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.webmanifest" />
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <header class="topbar" role="banner">
+    <div class="brand">
+      <span class="brand-mark">▲</span>
+      <div class="brand-text">
+        <div class="brand-title">M Tucker A</div>
+        <div class="brand-sub" id="topSub">Plan</div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <select id="weekSelect" class="week-select" aria-label="Week"></select>
+    </div>
+  </header>
+
+  <main id="view" class="view" role="main"></main>
+
+  <nav class="tabbar" role="navigation" aria-label="Primary">
+    <button class="tab" data-tab="plan" aria-label="Plan">
+      <span class="tab-icon" aria-hidden="true">◳</span><span class="tab-label">Plan</span>
+    </button>
+    <button class="tab" data-tab="log" aria-label="Log">
+      <span class="tab-icon" aria-hidden="true">●</span><span class="tab-label">Log</span>
+    </button>
+    <button class="tab" data-tab="history" aria-label="History">
+      <span class="tab-icon" aria-hidden="true">≡</span><span class="tab-label">History</span>
+    </button>
+    <button class="tab" data-tab="app" aria-label="App">
+      <span class="tab-icon" aria-hidden="true">⚙</span><span class="tab-label">App</span>
+    </button>
+  </nav>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="data/plan.js"></script>
+  <script src="app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('service-worker.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
